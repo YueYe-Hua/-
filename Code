@@ -1,0 +1,295 @@
+using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
+
+namespace mytraceroute;
+
+internal static class Program
+{
+    // настройки traceroute
+    private const int DefaultMaxHops = 30;
+    private const int DefaultProbesPerHop = 3;
+    private const int DefaultTimeoutMs = 4000;
+    private const int IcmpEchoRequestType = 8;
+    private const int IcmpEchoReplyType = 0;
+    private const int IcmpTimeExceededType = 11;
+
+    private static ushort _identifier;
+    private static ushort _sequence;
+
+    private readonly struct PendingProbe
+    {
+        public PendingProbe(ushort sequence, DateTime sentAt)
+        {
+            Sequence = sequence;
+            SentAt = sentAt;
+        }
+
+        public ushort Sequence { get; }
+        public DateTime SentAt { get; }
+    }
+
+    private static void Main(string[] args)
+    {
+        if (args.Length < 1)
+        {
+            PrintUsage();
+            return;
+        }
+
+        if (!IPAddress.TryParse(args[0], out var targetIp) || targetIp.AddressFamily != AddressFamily.InterNetwork)
+        {
+            Console.WriteLine("Целевой адрес должен быть допустимым IPv4 адресом.");
+            return;
+        }
+
+        int maxHops = args.Length >= 2 && int.TryParse(args[1], out var mh) ? mh : DefaultMaxHops;
+        int probesPerHop = args.Length >= 3 && int.TryParse(args[2], out var pp) ? pp : DefaultProbesPerHop;
+        int timeoutMs = args.Length >= 4 && int.TryParse(args[3], out var tm) ? tm : DefaultTimeoutMs;
+
+        _identifier = (ushort)(Process.GetCurrentProcess().Id & 0xFFFF);
+        if (_identifier == 0) _identifier = 0x1234;
+        _sequence = 1;
+
+        try
+        {
+            RunTraceroute(targetIp, maxHops, probesPerHop, timeoutMs);
+        }
+        catch (SocketException ex)
+        {
+            // Raw сокеты требуют права администратора.
+            Console.WriteLine($"Ошибка сокета: {ex.SocketErrorCode} ({ex.Message})");
+            Console.WriteLine("Запустите программу из командной строки с правами администратора.");
+        }
+    }
+
+    private static void PrintUsage()
+    {
+        Console.WriteLine("Используйте команду mytraceroute через командную строку.");
+        Console.WriteLine("Пример ввода:  mytraceroute 8.8.8.8");
+    }
+
+    private static void RunTraceroute(IPAddress targetIp, int maxHops, int probesPerHop, int timeoutMs)
+    {
+        using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Raw, ProtocolType.Icmp);
+
+        // Получение IPv4 ICMP пакетов и возможность установки TTL для каждой отправки.
+        socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.IpTimeToLive, 1);
+
+        // Таймаут приема raw-сокета обновляется для каждого хопа в цикле.
+        socket.ReceiveTimeout = timeoutMs;
+
+        var sendBuffer = new byte[64];
+        var recvBuffer = new byte[65535];
+
+        for (int ttl = 1; ttl <= maxHops; ttl++)
+        {
+            var pending = new Dictionary<ushort, PendingProbe>(capacity: probesPerHop);
+            var seqs = new ushort[probesPerHop];
+            var rtts = new double?[probesPerHop];
+            var responderIps = new IPAddress?[probesPerHop];
+
+            // Сначала отправляем все зонды для этого TTL.
+            for (int i = 0; i < probesPerHop; i++)
+            {
+                var seq = _sequence++;
+                seqs[i] = seq;
+                pending[seq] = new PendingProbe(seq, DateTime.UtcNow);
+
+                byte[] packet = BuildIcmpEchoRequest(_identifier, seq, sendBuffer);
+
+                // TTL применяется к следующему исходящему пакету от этого сокета.
+                socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.IpTimeToLive, ttl);
+                socket.SendTo(packet, new IPEndPoint(targetIp, 0));
+            }
+
+            // Ожидание ответов до истечения времени.
+            var hopStopwatch = Stopwatch.StartNew();
+            while (pending.Count > 0 && hopStopwatch.ElapsedMilliseconds < timeoutMs)
+            {
+                int remaining = (int)Math.Max(0, timeoutMs - hopStopwatch.ElapsedMilliseconds);
+                socket.ReceiveTimeout = remaining;
+
+                EndPoint remote = new IPEndPoint(IPAddress.Any, 0);
+                int receivedBytes;
+
+                try
+                {
+                    receivedBytes = socket.ReceiveFrom(recvBuffer, ref remote);
+                }
+                catch (SocketException ex) when (ex.SocketErrorCode == SocketError.TimedOut)
+                {
+                    break;
+                }
+
+                if (receivedBytes <= 0)
+                    continue;
+
+                if (!TryExtractSequenceFromIcmp(recvBuffer, receivedBytes, out var respondedSeq, out var icmpType))
+                    continue;
+
+                if (respondedSeq == 0 || !pending.TryGetValue(respondedSeq, out var probe))
+                    continue;
+
+                // rtt с момента отправки конкретного зонда
+                double rttMs = (DateTime.UtcNow - probe.SentAt).TotalMilliseconds;
+                var idx = Array.IndexOf(seqs, respondedSeq);
+                if (idx < 0) continue;
+
+                rtts[idx] = rttMs;
+                responderIps[idx] = ((IPEndPoint)remote).Address;
+
+                // Для каждой последовательности достаточно одного ответа.
+                pending.Remove(respondedSeq);
+
+            }
+
+            //Находим первый ответивший IP для вывода одного адреса.
+            var hopIp = responderIps.FirstOrDefault(ip => ip is not null);
+
+            Console.Write($"{ttl,2} ");
+            if (hopIp is null)
+            {
+                for (int i = 0; i < probesPerHop; i++)
+                {
+                    Console.Write("* ");
+                }
+                Console.WriteLine();
+                continue;
+            }
+
+            Console.Write($"{hopIp} ");
+            for (int i = 0; i < probesPerHop; i++)
+            {
+                if (rtts[i] is double ms)
+                {
+                    var ip = responderIps[i];
+                    if (ip is not null && !ip.Equals(hopIp))
+                        Console.Write($"{ms,7:0.0} ms {ip} ");
+                    else
+                        Console.Write($"{ms,7:0.0} ms ");
+                }
+                else
+                {
+                    Console.Write($"{ "*",7} ");
+                }
+            }
+            Console.WriteLine();
+
+            // Останавливаемся, если пункт назначения ответил
+            if (rtts.Any(rt => rt is double) && responderIps.Any(ip => ip != null && ip.Equals(targetIp)))
+                break;
+        }
+    }
+
+    private static byte[] BuildIcmpEchoRequest(ushort identifier, ushort sequence, byte[] payloadBuffer)
+    {
+        // 8 байт ICMP заголовка + полезная нагрузка.
+        const int icmpHeaderLen = 8;
+        int payloadLen = payloadBuffer.Length - icmpHeaderLen;
+        if (payloadLen < 1) payloadLen = 32;
+
+        int packetLen = icmpHeaderLen + payloadLen;
+        var packet = new byte[packetLen];
+        packet[0] = IcmpEchoRequestType; // тип
+        packet[1] = 0; // код
+        // контрольная сумма по смещению [2..3] будет заполнена позже
+
+        packet[4] = (byte)(identifier >> 8);
+        packet[5] = (byte)(identifier & 0xFF);
+
+        packet[6] = (byte)(sequence >> 8);
+        packet[7] = (byte)(sequence & 0xFF);
+
+        // Заполняем полезную нагрузку детерминированными байтами
+        for (int i = 0; i < payloadLen; i++)
+            packet[icmpHeaderLen + i] = (byte)(i & 0xFF);
+
+        ushort checksum = ComputeChecksum(packet);
+        packet[2] = (byte)(checksum >> 8);
+        packet[3] = (byte)(checksum & 0xFF);
+
+        return packet;
+    }
+
+    private static ushort ComputeChecksum(byte[] data)
+    {
+        uint sum = 0;
+        int i = 0;
+
+        while (i + 1 < data.Length)
+        {
+            sum += (uint)((data[i] << 8) | data[i + 1]);
+            i += 2;
+        }
+
+        if (i < data.Length)
+            sum += (uint)(data[i] << 8);
+
+        while ((sum >> 16) != 0)
+            sum = (sum & 0xFFFF) + (sum >> 16);
+
+        return (ushort)~sum;
+    }
+
+    private static bool TryExtractSequenceFromIcmp(byte[] buffer, int length, out ushort sequence, out int icmpType)
+    {
+        sequence = 0;
+        icmpType = -1;
+
+        if (length < 8)
+            return false;
+
+        // Некоторые системы возвращают IP-заголовок + ICMP; другие возвращают только ICMP.
+        // Определяем IPv4 заголовок по версии и полю протокола (ICMP=1).
+        int icmpOffset = 0;
+        if (length >= 20 && ((buffer[0] >> 4) == 4) && buffer[9] == 1)
+        {
+            int ihl = buffer[0] & 0x0F;
+            icmpOffset = ihl * 4;
+            if (icmpOffset < 0 || icmpOffset + 8 > length)
+                return false;
+        }
+
+        icmpType = buffer[icmpOffset];
+        int icmpCode = buffer[icmpOffset + 1];
+
+        // Echo Reply: ICMP заголовок напрямую содержит идентификатор/последовательность.
+        if (icmpType == IcmpEchoReplyType && icmpCode == 0)
+        {
+            if (icmpOffset + 8 > length) return false;
+            ushort id = ReadUInt16BE(buffer, icmpOffset + 4);
+            if (id != _identifier) return false;
+            sequence = ReadUInt16BE(buffer, icmpOffset + 6);
+            return sequence != 0;
+        }
+
+        // Time Exceeded: встроенный исходный IPv4 заголовок + первые 8 байт исходной полезной нагрузки.
+        if (icmpType == IcmpTimeExceededType)
+        {
+            // Внешний ICMP заголовок составляет 8 байт.
+            int innerIpStart = icmpOffset + 8;
+            if (innerIpStart + 20 > length) return false;
+
+            if ((buffer[innerIpStart] >> 4) != 4) return false; // не IPv4
+            int innerIhl = buffer[innerIpStart] & 0x0F;
+            int innerIpLen = innerIhl * 4;
+            int innerIcmpStart = innerIpStart + innerIpLen;
+
+            // Встроенный ICMP Echo заголовок: требуется минимум 8 байт.
+            if (innerIcmpStart + 8 > length) return false;
+
+            ushort id = ReadUInt16BE(buffer, innerIcmpStart + 4);
+            if (id != _identifier) return false;
+            sequence = ReadUInt16BE(buffer, innerIcmpStart + 6);
+            return sequence != 0;
+        }
+
+        return false;
+    }
+
+    private static ushort ReadUInt16BE(byte[] buffer, int offset)
+    {
+        return (ushort)((buffer[offset] << 8) | buffer[offset + 1]);
+    }
+}
